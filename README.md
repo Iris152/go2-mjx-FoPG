@@ -7,7 +7,7 @@ The current main path uses `mujoco_menagerie/unitree_go2/scene_mjx.xml` consiste
 ## Contents
 
 - `train_go2_mjx_local.py`: local two-stage APG/FoPG training entrypoint for GO2.
-- `GO2_train.ipynb`: original notebook record of the successful training workflow.
+- `GO2_train_Colab.ipynb`: original Colab notebook used to train the two-stage GO2 policy.
 - `GO2_train_local.ipynb`: local notebook wrapper around the current training script.
 - `go2_policy_viewer_selectable.py`, `go2_local_policy_viewer.py`: MuJoCo policy viewers for checkpoints.
 - `export_go2_policy_to_onnx_fixed.py`: export Brax/APG checkpoints to deterministic ONNX policies.
@@ -31,7 +31,7 @@ pip install -r requirements.txt
 
 `unitree_sdk2py` is usually installed from Unitree's SDK2 Python repository or package source, depending on your robot-side environment. It is listed separately in `requirements-deploy.txt` because real-robot deployment often uses a vendor-specific installation path.
 
-## Train
+## Train Locally
 
 ```bash
 python train_go2_mjx_local.py
@@ -42,6 +42,12 @@ By default the script uses:
 - XML: `mujoco_menagerie/unitree_go2/scene_mjx.xml`
 - output checkpoints: `go2_policy_export_local/`
 - run artifacts: `local_training_runs/` (ignored by git)
+
+## Train In Colab
+
+Use `GO2_train_Colab.ipynb` when reproducing the original Colab workflow. That notebook installs MuJoCo/MJX/Brax in the Colab runtime, clones `mujoco_menagerie`, trains the same two-stage trot plus forward-residual policy, and exports the trained checkpoint zip from `/content/go2_policy_export`.
+
+Use `GO2_train_local.ipynb` or `train_go2_mjx_local.py` for the cleaned local workflow in this repository. The local path uses the checked-in `mujoco_menagerie/unitree_go2/scene_mjx.xml` instead of cloning the full menagerie every time.
 
 ## View Checkpoints
 
