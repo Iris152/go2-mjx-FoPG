@@ -12,6 +12,7 @@
 - 内置 joint remap：
   - 策略顺序：`FL, FR, RL, RR`
   - Unitree 低层顺序：`FR, FL, RR, RL`
+- 实机模式下默认通过 `MotionSwitcher` 检查并释放 Go2 主运控服务 MCF，避免 `sport_mode` 等高层服务和低层 `LowCmd` 抢控制权
 - 内置站立缓启动、策略渐入、姿态保护、退出时回站立再切 passive
 
 ## 2. 运行前准备
@@ -112,6 +113,8 @@ python launch_unitree_mujoco_python_sim.py \
 - 电脑网口设置为 `192.168.123.222/24`
 - 确认连接机器狗的网卡名，比如 `enp5s0`
 
+`go2_unitree_sdk2_deploy.py` 默认 `--release_mcf auto`：当 `--domain_id 0` 时会先调用 SDK2 `MotionSwitcher.CheckMode()` 查询当前运动服务；如果发现 `sport_mode` / `ai_sport` / `advanced_sport` 等服务仍然激活，会调用 `ReleaseMode()` 释放，直到 MCF 关闭后才进入低层控制。这个逻辑对应 Unitree `go2_stand_example.cpp` 的做法。
+
 然后执行：
 
 ```bash
@@ -121,6 +124,8 @@ python go2_unitree_sdk2_deploy.py \
 ```
 
 第一次真机不要加 `--auto_start --auto_policy`，先手动触发更稳。
+
+如果只是做本地仿真，`--domain_id 1` 下会自动跳过 MCF 释放；如果实机上你已经手动确认 MCF 关闭，也可以显式加 `--release_mcf never`，但不建议作为默认做法。
 
 ## 5. 建议的验证顺序
 
@@ -158,9 +163,23 @@ python go2_unitree_sdk2_deploy.py \
   --policy_ramp_duration 2.0
 ```
 
+手动控制 MCF 释放策略：
+
+```bash
+# 默认：domain_id=0 时释放，domain_id=1 时跳过
+python go2_unitree_sdk2_deploy.py --network enp5s0 --domain_id 0 --release_mcf auto
+
+# 强制释放，用于排查
+python go2_unitree_sdk2_deploy.py --network enp5s0 --domain_id 0 --release_mcf always
+
+# 跳过释放，仅在你已经确认 MCF 关闭时使用
+python go2_unitree_sdk2_deploy.py --network enp5s0 --domain_id 0 --release_mcf never
+```
+
 ## 7. 现在最值得先看的风险点
 
 - joint remap 是否正确
+- MCF 是否已经释放，不能让 `sport_mode` 等高层服务同时控制机器人
 - `stand_kp/kd` 和 `policy_kp/kd` 是否偏硬
 - IMU 倾角保护是否会过早触发
 - 你当前策略是固定前进，不是手柄速度跟随

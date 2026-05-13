@@ -103,6 +103,8 @@ Use `go2_unitree_sdk2_deploy.py` for the current real-robot deployment path. The
 python go2_unitree_sdk2_deploy.py --network <robot_nic> --domain_id 0
 ```
 
+With `--domain_id 0`, the runner defaults to `--release_mcf auto`: it queries Go2's MotionSwitcher service and calls `ReleaseMode()` before low-level control if a high-level motion service such as `sport_mode` is active. This mirrors Unitree's low-level stand example and avoids MCF/high-level control fighting with `rt/lowcmd`.
+
 See `GO2_DEPLOY_GUIDE.md` for the full staged checklist.
 
 ## Not Included

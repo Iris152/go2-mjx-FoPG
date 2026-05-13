@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import json
 import math
 import select
 import signal
@@ -43,6 +44,31 @@ try:
     )
     from unitree_sdk2py.idl.default import unitree_go_msg_dds__LowCmd_
     from unitree_sdk2py.idl.unitree_go.msg.dds_ import LowCmd_, LowState_
+    try:
+        from unitree_sdk2py.comm.motion_switcher.motion_switcher_client import (
+            MotionSwitcherClient,
+        )
+    except ImportError:
+        from unitree_sdk2py.rpc.client import Client
+
+        class MotionSwitcherClient(Client):
+            def __init__(self):
+                super().__init__("motion_switcher", False)
+
+            def Init(self):
+                self._SetApiVerson("1.0.0.1")
+                self._RegistApi(1001, 0)
+                self._RegistApi(1003, 0)
+
+            def CheckMode(self):
+                code, data = self._Call(1001, json.dumps({}))
+                if code == 0 and data:
+                    return code, json.loads(data)
+                return code, None
+
+            def ReleaseMode(self):
+                code, _ = self._Call(1003, json.dumps({}))
+                return code, None
 except ImportError as exc:
     missing = getattr(exc, "name", "unknown")
     raise SystemExit(
@@ -86,6 +112,82 @@ OFFICIAL_STAND_UP_UNITREE = np.array(
 
 PASSIVE_MOTOR_COUNT = 20
 LOWCMD_PACK_FMT = "<4B4IH2x" + "B3x5f3I" * 20 + "4B" + "55Bx2I"
+
+
+def should_release_mcf(args: argparse.Namespace) -> bool:
+    if args.release_mcf == "always":
+        return True
+    if args.release_mcf == "never":
+        return False
+    return int(args.domain_id) == 0
+
+
+def query_motion_service_name(robot_form: str, motion_name: str) -> str:
+    if robot_form == "0":
+        if motion_name == "normal":
+            return "sport_mode"
+        if motion_name == "ai":
+            return "ai_sport"
+        if motion_name == "advanced":
+            return "advanced_sport"
+    else:
+        if motion_name == "ai-w":
+            return "wheeled_sport(go2W)"
+        if motion_name == "normal-w":
+            return "wheeled_sport(b2W)"
+    return motion_name or "<unknown>"
+
+
+def release_mcf_if_needed(args: argparse.Namespace) -> None:
+    if not should_release_mcf(args):
+        print("[mcf] Motion-control service release skipped.", flush=True)
+        return
+
+    msc = MotionSwitcherClient()
+    msc.SetTimeout(float(args.mcf_timeout))
+    msc.Init()
+
+    max_attempts = max(1, int(args.mcf_release_retries))
+    for attempt in range(1, max_attempts + 1):
+        code, status = msc.CheckMode()
+        if code != 0:
+            message = f"[mcf] CheckMode failed with code {code}."
+            if args.mcf_allow_failure:
+                print(message + " Continuing because --mcf_allow_failure is set.", flush=True)
+                return
+            raise SystemExit(message)
+
+        status = status or {}
+        robot_form = str(status.get("form", ""))
+        motion_name = str(status.get("name", ""))
+        if not motion_name:
+            print("[mcf] Motion-control service is deactivated.", flush=True)
+            return
+
+        service_name = query_motion_service_name(robot_form, motion_name)
+        print(
+            f"[mcf] Active motion-control service detected: {service_name} "
+            f"(form={robot_form}, name={motion_name}).",
+            flush=True,
+        )
+        code, _ = msc.ReleaseMode()
+        if code == 0:
+            print(f"[mcf] ReleaseMode succeeded ({attempt}/{max_attempts}).", flush=True)
+        else:
+            message = f"[mcf] ReleaseMode failed with code {code} ({attempt}/{max_attempts})."
+            if args.mcf_allow_failure:
+                print(message + " Continuing because --mcf_allow_failure is set.", flush=True)
+                return
+            print(message, flush=True)
+
+        if attempt < max_attempts:
+            time.sleep(float(args.mcf_retry_delay))
+
+    message = "[mcf] Motion-control service is still active after ReleaseMode retries."
+    if args.mcf_allow_failure:
+        print(message + " Continuing because --mcf_allow_failure is set.", flush=True)
+        return
+    raise SystemExit(message)
 
 
 def crc32_core(words: Sequence[int]) -> int:
@@ -766,19 +868,37 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--auto_start", action="store_true", help="Start stand-up without waiting for Enter")
     parser.add_argument("--auto_policy", action="store_true", help="Start policy automatically after stand-up")
     parser.add_argument("--print_timing", action="store_true")
+    parser.add_argument(
+        "--release_mcf",
+        choices=["auto", "always", "never"],
+        default="auto",
+        help=(
+            "Release Go2 motion-control services through MotionSwitcher before "
+            "low-level control. auto releases only when domain_id=0."
+        ),
+    )
+    parser.add_argument("--mcf_timeout", type=float, default=10.0)
+    parser.add_argument("--mcf_release_retries", type=int, default=5)
+    parser.add_argument("--mcf_retry_delay", type=float, default=2.0)
+    parser.add_argument(
+        "--mcf_allow_failure",
+        action="store_true",
+        help="Continue even if CheckMode/ReleaseMode fails. Not recommended on the real robot.",
+    )
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
     print(
-        "[config] network=%s domain_id=%s mode=%s command_center=%s clip_final_action=%s baseline=%s forward=%s"
+        "[config] network=%s domain_id=%s mode=%s command_center=%s clip_final_action=%s release_mcf=%s baseline=%s forward=%s"
         % (
             args.network,
             args.domain_id,
             args.mode,
             args.command_center,
             args.clip_final_action,
+            args.release_mcf,
             args.baseline_onnx,
             args.forward_onnx,
         ),
@@ -787,6 +907,7 @@ def main() -> int:
     print("[config] policy order -> unitree order map:", POLICY_TO_UNITREE.tolist(), flush=True)
 
     ChannelFactoryInitialize(args.domain_id, args.network)
+    release_mcf_if_needed(args)
     runner = Go2DeployRunner(args)
 
     def _signal_handler(signum, _frame):
