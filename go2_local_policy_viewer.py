@@ -1,58 +1,297 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 from __future__ import annotations
 
 import argparse
+import functools
 import time
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 import jax
 import jax.numpy as jp
 import mujoco
 import mujoco.viewer
+import numpy as np
+from brax import math
+from brax.io import model as brax_model
+from brax.training.acme import running_statistics
+from brax.training.agents.apg import networks as apg_networks
+from jax import config
 
-from go2_policy_viewer_selectable import (
-    ACTION_SIZE,
-    BASELINE_OBS_SIZE,
-    DEFAULT_XML_PATH,
-    FORWARD_OBS_SIZE,
-    PHYSICS_STEPS_PER_CONTROL,
-    PolicyBundle,
-    Go2PolicyViewer,
-    build_apg_policy,
-)
-
+config.update("jax_enable_x64", True)
+config.update("jax_default_matmul_precision", "high")
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_POLICY_ROOT = SCRIPT_DIR / "go2_policy_export_local"
+DEFAULT_RUN_ROOT = SCRIPT_DIR / "local_training_runs"
+DEFAULT_XML_PATH = SCRIPT_DIR / "mujoco_menagerie" / "unitree_go2" / "scene_mjx.xml"
+
+KEYFRAME_NAME = "home"
+PHYSICS_STEPS_PER_CONTROL = 10
+ACTION_SIZE = 12
+BASELINE_OBS_SIZE = 40
+FORWARD_OBS_SIZE = 52
 
 
-class LocalGo2PolicyViewer(Go2PolicyViewer):
-    """Viewer variant for policies produced by GO2_train_local.ipynb."""
+@dataclass
+class PolicyBundle:
+    """保存两阶段策略推理函数。"""
+
+    baseline_policy: Callable
+    forward_policy: Callable | None = None
+
+
+def cos_wave(t: jp.ndarray, step_period: float, scale: float) -> jp.ndarray:
+    wave = -jp.cos(((2.0 * jp.pi) / step_period) * t)
+    return wave * (scale / 2.0) + (scale / 2.0)
+
+
+def make_kinematic_ref(
+    sinusoid: Callable,
+    step_k: int,
+    scale: float = 0.3,
+    dt: float = 1.0 / 50.0,
+) -> jp.ndarray:
+    """构造和本地训练环境一致的 trot 运动学参考。"""
+    steps = jp.arange(step_k)
+    step_period = step_k * dt
+    t = steps * dt
+    wave = sinusoid(t, step_period, scale)
+
+    fleg_cmd_block = jp.concatenate(
+        [
+            jp.zeros((step_k, 1)),
+            wave.reshape(step_k, 1),
+            -2.0 * wave.reshape(step_k, 1),
+        ],
+        axis=1,
+    )
+    h_leg_cmd_block = fleg_cmd_block
+
+    block1 = jp.concatenate(
+        [
+            jp.zeros((step_k, 3)),
+            fleg_cmd_block,
+            h_leg_cmd_block,
+            jp.zeros((step_k, 3)),
+        ],
+        axis=1,
+    )
+    block2 = jp.concatenate(
+        [
+            fleg_cmd_block,
+            jp.zeros((step_k, 3)),
+            jp.zeros((step_k, 3)),
+            h_leg_cmd_block,
+        ],
+        axis=1,
+    )
+    return jp.concatenate([block1, block2], axis=0)
+
+
+def build_apg_policy(
+    obs_size: int,
+    action_size: int,
+    hidden_layer_sizes: tuple[int, ...],
+    params_path: str,
+    deterministic: bool = True,
+) -> Callable:
+    """按训练网络结构重建 APG 推理函数，并加载 Brax 参数。
+
+    默认使用 deterministic=True，与 ONNX 部署链路保持一致。
+    """
+    make_networks_factory = functools.partial(
+        apg_networks.make_apg_networks,
+        hidden_layer_sizes=hidden_layer_sizes,
+    )
+    nets = make_networks_factory(
+        observation_size=obs_size,
+        action_size=action_size,
+        preprocess_observations_fn=running_statistics.normalize,
+    )
+    make_inference_fn = apg_networks.make_inference_fn(nets)
+    params = brax_model.load_params(params_path)
+    return jax.jit(make_inference_fn(params, deterministic=deterministic))
+
+
+def _checkpoint_root_has_required_files(root: Path, mode: str) -> bool:
+    if not (root / "trotting_2hz_policy").exists():
+        return False
+    if mode == "forward" and not (root / "forward_locomotion_policy").exists():
+        return False
+    return True
+
+
+def find_latest_complete_run(mode: str, run_root: Path = DEFAULT_RUN_ROOT) -> Path | None:
+    """Find the newest local_training_runs entry usable by the selected mode."""
+    if not run_root.exists():
+        return None
+
+    candidates: list[tuple[float, Path]] = []
+    for checkpoints_dir in run_root.glob("*/checkpoints"):
+        if not checkpoints_dir.is_dir():
+            continue
+        if not _checkpoint_root_has_required_files(checkpoints_dir, mode):
+            continue
+        run_dir = checkpoints_dir.parent
+        latest_mtime = max(
+            (p.stat().st_mtime for p in checkpoints_dir.iterdir() if p.is_file()),
+            default=checkpoints_dir.stat().st_mtime,
+        )
+        candidates.append((latest_mtime, run_dir))
+
+    if not candidates:
+        return None
+    return max(candidates, key=lambda item: item[0])[1]
+
+
+class LocalGo2PolicyViewer:
+    """独立版本地策略 viewer，不再依赖 go2_policy_viewer_selectable.py。"""
 
     def __init__(
         self,
-        *args,
+        xml_path: str | Path,
+        policy_bundle: PolicyBundle,
+        mode: str = "forward",
+        step_k: int = 13,
+        seed: int = 0,
+        control_decimation: int = PHYSICS_STEPS_PER_CONTROL,
+        track_camera: bool = True,
         clip_final_action: bool = False,
         phase_stride: int = 1,
-        **kwargs,
     ):
-        super().__init__(*args, **kwargs)
+        if mode not in ("trot", "forward"):
+            raise ValueError(f"未知 mode: {mode}，可选值为 trot 或 forward。")
+        if mode == "forward" and policy_bundle.forward_policy is None:
+            raise ValueError("--mode forward 需要 forward_policy。")
+
+        resolved_xml = Path(xml_path).expanduser().resolve()
+        if not resolved_xml.exists():
+            raise FileNotFoundError(
+                f"未找到 XML：{resolved_xml}\n"
+                "请确认 mujoco_menagerie/unitree_go2/scene_mjx.xml 路径正确。"
+            )
+
+        self.xml_path = str(resolved_xml)
+        self.policy_bundle = policy_bundle
+        self.mode = mode
+        self.step_k = int(step_k)
+        self.control_decimation = int(control_decimation)
+        self.track_camera = bool(track_camera)
         self.clip_final_action = bool(clip_final_action)
         self.phase_stride = int(phase_stride)
+        self.rng = jax.random.PRNGKey(seed)
+
+        self.model = mujoco.MjModel.from_xml_path(self.xml_path)
+        self.data = mujoco.MjData(self.model)
+
+        # 与本地训练环境保持一致：menagerie XML 载入后手动覆盖 position actuator PD。
+        kp = 50.0
+        kd = 0.5
+        self.model.actuator_gainprm[:, 0] = kp
+        self.model.actuator_biasprm[:, 1] = -kp
+        self.model.actuator_biasprm[:, 2] = -kd
+
+        self.control_dt = self.model.opt.timestep * self.control_decimation
+        self.action_loc = self.model.keyframe(KEYFRAME_NAME).qpos[7:].copy()
+        self.action_scale = np.array([0.2, 0.6, 0.6] * 4, dtype=np.float64)
+        self.init_q = self.model.keyframe(KEYFRAME_NAME).qpos.copy()
+
+        self.l_cycle = int(
+            make_kinematic_ref(cos_wave, self.step_k, scale=0.3, dt=self.control_dt).shape[0]
+        )
+        self.kinematic_ref_qpos = np.asarray(
+            make_kinematic_ref(cos_wave, self.step_k, scale=0.3, dt=self.control_dt)
+            + self.action_loc
+        )
+
+        self.last_action = np.zeros(ACTION_SIZE, dtype=np.float64)
+        self.inner_obs = jp.zeros(BASELINE_OBS_SIZE, dtype=jp.float64)
+        self.outer_obs = jp.zeros(FORWARD_OBS_SIZE, dtype=jp.float64)
+        self.control_steps = 0
+        self.physics_steps = 0
+
+    def reset(self) -> None:
+        self.data.qpos[:] = self.init_q
+        self.data.qvel[:] = 0.0
+        self.data.ctrl[:] = self.action_loc
+        mujoco.mj_forward(self.model, self.data)
+
+        if self.data.ncon > 0:
+            pen = np.min(self.data.contact.dist[: self.data.ncon])
+            self.data.qpos[2] -= pen
+            self.data.qvel[:] = 0.0
+            mujoco.mj_forward(self.model, self.data)
+
+        self.last_action[:] = 0.0
+        self.control_steps = 0
+        self.physics_steps = 0
+        self.inner_obs = self._get_inner_obs()
+
+        if self.mode == "forward":
+            baseline_action = self._sample_policy(self.policy_bundle.baseline_policy, self.inner_obs)
+            self.outer_obs = jp.concatenate([self.inner_obs, baseline_action])
+
+    def _split_rng(self) -> jp.ndarray:
+        act_rng, self.rng = jax.random.split(self.rng)
+        return act_rng
+
+    def _sample_policy(self, policy_fn: Callable, obs: jp.ndarray) -> jp.ndarray:
+        action, _ = policy_fn(obs, self._split_rng())
+        return action
+
+    def _get_base_quat(self) -> jp.ndarray:
+        return jp.array(self.data.xquat[1])
+
+    def _get_base_angvel_world(self) -> jp.ndarray:
+        return jp.array(self.data.cvel[1, :3])
+
+    def _get_inner_obs(self) -> jp.ndarray:
+        base_quat = self._get_base_quat()
+        inv_base_orientation = math.quat_inv(base_quat)
+        local_rpyrate = math.rotate(self._get_base_angvel_world(), inv_base_orientation)
+
+        obs_list = [
+            jp.array([local_rpyrate[2]]) * 0.25,
+            math.rotate(jp.array([0.0, 0.0, -1.0]), inv_base_orientation),
+            jp.array(self.data.qpos[7:19] - self.action_loc),
+            jp.array(self.last_action),
+            jp.array(self.kinematic_ref_qpos[self.control_steps % self.l_cycle]),
+        ]
+        return jp.clip(jp.concatenate(obs_list), -100.0, 100.0)
+
+    def _baseline_action(self) -> jp.ndarray:
+        return self._sample_policy(self.policy_bundle.baseline_policy, self.inner_obs)
 
     def _forward_action(self) -> jp.ndarray:
         if self.policy_bundle.forward_policy is None:
             raise RuntimeError("forward_policy 为空，无法运行 forward 模式。")
 
-        residual_action = self._sample_policy(self.policy_bundle.forward_policy, self.outer_obs)
+        # Stage2 训练环境裁剪 residual action，但不裁剪 baseline action。
+        residual_action = jp.clip(self._sample_policy(self.policy_bundle.forward_policy, self.outer_obs), -1.0, 1.0)
         baseline_action = self.outer_obs[-ACTION_SIZE:]
         action = residual_action + baseline_action
         if self.clip_final_action:
             action = jp.clip(action, -1.0, 1.0)
         return action
 
-    def refresh_observation(self):
-        # The local training env updates steps before building the next obs.
+    def compute_control(self) -> None:
+        if self.mode == "trot":
+            action = jp.clip(self._baseline_action(), -1.0, 1.0)
+        elif self.mode == "forward":
+            action = self._forward_action()
+        else:
+            raise ValueError(f"未知 mode: {self.mode}")
+
+        joint_target = self.action_loc + np.asarray(action, dtype=np.float64) * self.action_scale
+        self.data.ctrl[:] = joint_target
+        self.last_action[:] = joint_target
+
+    def refresh_observation(self) -> None:
+        # 本地训练环境是在构造下一拍观测前推进 control step。
         self.control_steps += self.phase_stride
         self.inner_obs = self._get_inner_obs()
 
@@ -60,15 +299,39 @@ class LocalGo2PolicyViewer(Go2PolicyViewer):
             baseline_action = self._sample_policy(self.policy_bundle.baseline_policy, self.inner_obs)
             self.outer_obs = jp.concatenate([self.inner_obs, baseline_action])
 
+    def warmup(self) -> None:
+        self.reset()
+        self.compute_control()
+        self.refresh_observation()
+        self.reset()
+
 
 def resolve_policy_paths(args: argparse.Namespace) -> tuple[Path, Path | None]:
     if args.run_dir:
         root = Path(args.run_dir).expanduser().resolve() / "checkpoints"
-    else:
+        print(f"[policy] using explicit run_dir: {Path(args.run_dir).expanduser().resolve()}")
+    elif args.policy_root:
         root = Path(args.policy_root).expanduser().resolve()
+        print(f"[policy] using explicit policy_root: {root}")
+    else:
+        latest_run = find_latest_complete_run(args.mode)
+        if latest_run is None:
+            root = DEFAULT_POLICY_ROOT.resolve()
+            print(f"[policy] no complete local run found; fallback to policy_root: {root}")
+        else:
+            root = latest_run / "checkpoints"
+            print(f"[policy] auto selected latest complete run: {latest_run}")
 
-    baseline = Path(args.baseline_policy_path).expanduser().resolve() if args.baseline_policy_path else root / "trotting_2hz_policy"
-    forward = Path(args.forward_policy_path).expanduser().resolve() if args.forward_policy_path else root / "forward_locomotion_policy"
+    baseline = (
+        Path(args.baseline_policy_path).expanduser().resolve()
+        if args.baseline_policy_path
+        else root / "trotting_2hz_policy"
+    )
+    forward = (
+        Path(args.forward_policy_path).expanduser().resolve()
+        if args.forward_policy_path
+        else root / "forward_locomotion_policy"
+    )
 
     if not baseline.exists():
         raise FileNotFoundError(f"未找到第一阶段策略: {baseline}")
@@ -79,12 +342,17 @@ def resolve_policy_paths(args: argparse.Namespace) -> tuple[Path, Path | None]:
     return baseline, forward
 
 
-def build_policy_bundle(args: argparse.Namespace, baseline_path: Path, forward_path: Path | None) -> PolicyBundle:
+def build_policy_bundle(
+    args: argparse.Namespace,
+    baseline_path: Path,
+    forward_path: Path | None,
+) -> PolicyBundle:
     baseline_policy = build_apg_policy(
         obs_size=BASELINE_OBS_SIZE,
         action_size=ACTION_SIZE,
         hidden_layer_sizes=(256, 128),
         params_path=str(baseline_path),
+        deterministic=not args.stochastic,
     )
     forward_policy = None
     if args.mode == "forward":
@@ -95,6 +363,7 @@ def build_policy_bundle(args: argparse.Namespace, baseline_path: Path, forward_p
             action_size=ACTION_SIZE,
             hidden_layer_sizes=(128, 64),
             params_path=str(forward_path),
+            deterministic=not args.stochastic,
         )
     return PolicyBundle(baseline_policy=baseline_policy, forward_policy=forward_policy)
 
@@ -114,14 +383,19 @@ def dry_run(runner: LocalGo2PolicyViewer, steps: int) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="观察本地 GO2 MJX 两阶段训练结果，默认读取 go2_policy_export_local。"
+        description="观察本地 GO2 MJX 两阶段训练结果。默认自动读取 local_training_runs 里最新的完整 run。"
     )
     parser.add_argument("--mode", choices=("trot", "forward"), default="forward")
-    parser.add_argument("--policy_root", type=str, default=str(DEFAULT_POLICY_ROOT))
+    parser.add_argument(
+        "--policy_root",
+        type=str,
+        default=None,
+        help="手动指定策略根目录；不填时自动使用 local_training_runs 中最新的完整 run。",
+    )
     parser.add_argument("--run_dir", type=str, default=None, help="可直接指向 local_training_runs/... 目录。")
     parser.add_argument("--baseline_policy_path", type=str, default=None)
     parser.add_argument("--forward_policy_path", type=str, default=None)
-    parser.add_argument("--xml_path", type=str, default=DEFAULT_XML_PATH)
+    parser.add_argument("--xml_path", type=str, default=str(DEFAULT_XML_PATH))
     parser.add_argument("--step_k", type=int, default=13)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--control_decimation", type=int, default=PHYSICS_STEPS_PER_CONTROL)
@@ -130,6 +404,11 @@ def parse_args() -> argparse.Namespace:
         "--clip_final_action",
         action="store_true",
         help="额外裁剪 baseline+residual。默认关闭，以匹配本地训练脚本默认行为。",
+    )
+    parser.add_argument(
+        "--stochastic",
+        action="store_true",
+        help="使用 APG 随机采样动作。默认关闭，和 ONNX 部署保持 deterministic 一致。",
     )
     parser.add_argument(
         "--force_cpu",
@@ -155,6 +434,7 @@ def main() -> int:
     if args.mode == "forward":
         print("forward:", forward_path)
     print("clip_final_action:", args.clip_final_action)
+    print("stochastic:", args.stochastic)
     print("phase_stride:", args.phase_stride)
 
     policy_bundle = build_policy_bundle(args, baseline_path, forward_path)

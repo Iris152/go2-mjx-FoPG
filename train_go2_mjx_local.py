@@ -66,7 +66,7 @@ HIP_BODY_NAMES = ("FL_hip", "FR_hip", "RL_hip", "RR_hip")
 ACTION_SIZE = 12
 BASELINE_OBS_SIZE = 40
 FORWARD_OBS_SIZE = 52
-ACTION_SCALE = np.array([0.2, 0.8, 0.8] * 4, dtype=np.float64)
+ACTION_SCALE = np.array([0.2, 0.6, 0.6] * 4, dtype=np.float64)
 
 STAGE1_HIDDEN = (256, 128)
 STAGE2_HIDDEN = (128, 64)
@@ -122,11 +122,13 @@ def get_body_ids(mj_model: mujoco.MjModel, body_names: tuple[str, ...]) -> jp.nd
     return body_ids - jp.array(1, dtype=jp.int32)
 
 
-def apply_training_servo_gain(mj_model: mujoco.MjModel, kp: float) -> None:
-    # Matches the successful notebook and viewer: the XML keeps the actuator
-    # structure, while training overwrites the position-servo proportional gain.
+def apply_training_servo_pd(mj_model: mujoco.MjModel, kp: float, kd: float) -> None:
+    # Keep the menagerie position-servo actuator structure, but make the
+    # training PD explicit so sim/viewer/deploy validation can use the same
+    # convention: torque ~= kp * (ctrl - q) - kd * dq.
     mj_model.actuator_gainprm[:, 0] = float(kp)
     mj_model.actuator_biasprm[:, 1] = -float(kp)
+    mj_model.actuator_biasprm[:, 2] = -float(kd)
 
 
 def cos_wave(t: jax.Array, step_period: float, scale: float) -> jax.Array:
@@ -249,6 +251,8 @@ def get_stage2_config() -> config_dict.ConfigDict:
                             orientation=-1.0,
                             height=0.5,
                             lin_vel_z=-1.0,
+                            lateral_velocity=-1.0,
+                            yaw_rate=-0.5,
                             torque=-0.01,
                             feet_pos=-1.0,
                             feet_height=-1.0,
@@ -268,6 +272,7 @@ class Go2MjxBaseEnv(PipelineEnv):
         xml_path: str,
         step_k: int,
         servo_kp: float,
+        servo_kd: float,
         termination_height: float,
         n_frames: int = 10,
         **kwargs,
@@ -276,10 +281,11 @@ class Go2MjxBaseEnv(PipelineEnv):
         self.xml_path = str(Path(xml_path).expanduser().resolve())
         self.step_k = int(step_k)
         self.servo_kp = float(servo_kp)
+        self.servo_kd = float(servo_kd)
         self.termination_height = float(termination_height)
 
         mj_model = mujoco.MjModel.from_xml_path(self.xml_path)
-        apply_training_servo_gain(mj_model, self.servo_kp)
+        apply_training_servo_pd(mj_model, self.servo_kp, self.servo_kd)
         self._mj_model = mj_model
 
         sys = mjcf.load_model(mj_model)
@@ -353,7 +359,8 @@ class TrotGo2Local(Go2MjxBaseEnv):
         *,
         xml_path: str = str(DEFAULT_XML_PATH),
         step_k: int = 13,
-        servo_kp: float = 230.0,
+        servo_kp: float = 50.0,
+        servo_kd: float = 0.5,
         termination_height: float = 0.25,
         **kwargs,
     ):
@@ -361,6 +368,7 @@ class TrotGo2Local(Go2MjxBaseEnv):
             xml_path=xml_path,
             step_k=step_k,
             servo_kp=servo_kp,
+            servo_kd=servo_kd,
             termination_height=termination_height,
             **kwargs,
         )
@@ -488,7 +496,8 @@ class FwdTrotGo2Local(Go2MjxBaseEnv):
         xml_path: str = str(DEFAULT_XML_PATH),
         target_vel: float = 0.75,
         step_k: int = 13,
-        servo_kp: float = 230.0,
+        servo_kp: float = 50.0,
+        servo_kd: float = 0.5,
         termination_height: float = 0.25,
         clip_final_action: bool = False,
         **kwargs,
@@ -497,6 +506,7 @@ class FwdTrotGo2Local(Go2MjxBaseEnv):
             xml_path=xml_path,
             step_k=step_k,
             servo_kp=servo_kp,
+            servo_kd=servo_kd,
             termination_height=termination_height,
             **kwargs,
         )
@@ -535,6 +545,8 @@ class FwdTrotGo2Local(Go2MjxBaseEnv):
                 "orientation": jp.array(0.0),
                 "height": jp.array(0.0),
                 "lin_vel_z": jp.array(0.0),
+                "lateral_velocity": jp.array(0.0),
+                "yaw_rate": jp.array(0.0),
                 "torque": jp.array(0.0),
                 "joint_velocity": jp.array(0.0),
                 "feet_pos": jp.array(0.0),
@@ -602,6 +614,10 @@ class FwdTrotGo2Local(Go2MjxBaseEnv):
             ),
             "orientation": self._reward_orientation(x) * self.reward_config.rewards.scales.orientation,
             "lin_vel_z": self._reward_lin_vel_z(xd) * self.reward_config.rewards.scales.lin_vel_z,
+            "lateral_velocity": (
+                self._reward_lateral_velocity(x, xd) * self.reward_config.rewards.scales.lateral_velocity
+            ),
+            "yaw_rate": self._reward_yaw_rate(x, xd) * self.reward_config.rewards.scales.yaw_rate,
             "height": self._reward_height(data.qpos) * self.reward_config.rewards.scales.height,
             "torque": self._reward_action(data.qfrc_actuator) * self.reward_config.rewards.scales.torque,
             "joint_velocity": (
@@ -644,6 +660,14 @@ class FwdTrotGo2Local(Go2MjxBaseEnv):
         local_vel = math.rotate(xd.vel[0], math.quat_inv(x.rot[0]))
         lin_vel_error = jp.sum(jp.square(commands[:2] - local_vel[:2]))
         return jp.exp(-lin_vel_error)
+
+    def _reward_lateral_velocity(self, x: Transform, xd: Motion) -> jax.Array:
+        local_vel = math.rotate(xd.vel[0], math.quat_inv(x.rot[0]))
+        return jp.clip(jp.square(local_vel[1]), 0.0, 10.0)
+
+    def _reward_yaw_rate(self, x: Transform, xd: Motion) -> jax.Array:
+        local_ang = math.rotate(xd.ang[0], math.quat_inv(x.rot[0]))
+        return jp.clip(jp.square(local_ang[2]), 0.0, 10.0)
 
     def _reward_orientation(self, x: Transform) -> jax.Array:
         up = jp.array([0.0, 0.0, 1.0])
@@ -728,6 +752,7 @@ def make_progress_logger(total_updates: int, num_evals: int, label: str) -> Prog
         completed_updates = min(int(it) * updates_per_eval, total_updates)
         reward_mean = float(np.asarray(metrics["eval/episode_reward"]))
         reward_std = float(np.asarray(metrics["eval/episode_reward_std"]))
+        avg_episode_length = float(np.asarray(metrics.get("eval/avg_episode_length", np.nan)))
         elapsed_s = time.time() - started
 
         x_data.append(completed_updates)
@@ -738,12 +763,14 @@ def make_progress_logger(total_updates: int, num_evals: int, label: str) -> Prog
                 "update": float(completed_updates),
                 "eval_episode_reward": reward_mean,
                 "eval_episode_reward_std": reward_std,
+                "eval_avg_episode_length": avg_episode_length,
                 "elapsed_s": elapsed_s,
             }
         )
         print(
             f"[{label}] update {completed_updates:4d}/{total_updates} | "
             f"eval_reward={reward_mean: .6f} | std={reward_std: .6f} | "
+            f"len={avg_episode_length: .1f} | "
             f"elapsed={elapsed_s: .1f}s",
             flush=True,
         )
@@ -754,7 +781,16 @@ def make_progress_logger(total_updates: int, num_evals: int, label: str) -> Prog
 def save_progress_csv(rows: list[dict[str, float]], output_path: Path) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["update", "eval_episode_reward", "eval_episode_reward_std", "elapsed_s"])
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "update",
+                "eval_episode_reward",
+                "eval_episode_reward_std",
+                "eval_avg_episode_length",
+                "elapsed_s",
+            ],
+        )
         writer.writeheader()
         writer.writerows(rows)
 
@@ -882,12 +918,14 @@ def run_stage1(args: argparse.Namespace, run_dir: Path, xml_path: Path) -> tuple
         xml_path=str(xml_path),
         step_k=args.step_k,
         servo_kp=args.servo_kp,
+        servo_kd=args.servo_kd,
     )
     eval_env = envs.get_environment(
         "go2_mjx_local_trot",
         xml_path=str(xml_path),
         step_k=args.step_k,
         servo_kp=args.servo_kp,
+        servo_kd=args.servo_kd,
     )
 
     progress = make_progress_logger(args.stage1_updates, args.num_evals, "stage1")
@@ -954,6 +992,7 @@ def run_stage2(
         target_vel=args.target_vel,
         step_k=args.step_k,
         servo_kp=args.servo_kp,
+        servo_kd=args.servo_kd,
         clip_final_action=args.clip_final_action,
     )
 
@@ -1012,6 +1051,7 @@ def validate_setup(args: argparse.Namespace, xml_path: Path, baseline_checkpoint
         xml_path=str(xml_path),
         step_k=args.step_k,
         servo_kp=args.servo_kp,
+        servo_kd=args.servo_kd,
     )
     state = stage1.reset(jax.random.PRNGKey(args.seed))
     print("[validate] stage1 obs shape:", tuple(state.obs.shape), flush=True)
@@ -1035,6 +1075,7 @@ def validate_setup(args: argparse.Namespace, xml_path: Path, baseline_checkpoint
         target_vel=args.target_vel,
         step_k=args.step_k,
         servo_kp=args.servo_kp,
+        servo_kd=args.servo_kd,
         clip_final_action=args.clip_final_action,
     )
     state = stage2.reset(jax.random.PRNGKey(args.seed))
@@ -1052,7 +1093,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--baseline_checkpoint", type=str, default=None)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--step_k", type=int, default=13)
-    parser.add_argument("--servo_kp", type=float, default=230.0)
+    parser.add_argument("--servo_kp", type=float, default=50.0)
+    parser.add_argument("--servo_kd", type=float, default=0.5)
     parser.add_argument("--target_vel", type=float, default=0.75)
 
     parser.add_argument("--stage1_updates", type=int, default=499)

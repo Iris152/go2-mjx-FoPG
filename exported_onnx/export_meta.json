@@ -1,11 +1,13 @@
 {
   "format": "onnx",
   "policy_type": "brax_apg_deterministic",
+  "exporter": "manual_mlp_no_tensorflow",
   "input_dtype": "float32",
   "opset": 17,
   "baseline": {
-    "checkpoint": "go2_policy_export/trotting_2hz_policy",
-    "onnx": "exported_onnx/trotting_2hz_policy.onnx",
+    "checkpoint": "/home/a/文档/MJX/go2_policy_export_local/trotting_2hz_policy",
+    "onnx": "/home/a/文档/MJX/exported_onnx/trotting_2hz_policy.onnx",
+    "ort_onnx": "/home/a/文档/MJX/exported_onnx/trotting_2hz_policy_ort.onnx",
     "obs_size": 40,
     "action_size": 12,
     "hidden_layer_sizes": [
@@ -14,8 +16,9 @@
     ]
   },
   "forward": {
-    "checkpoint": "go2_policy_export/forward_locomotion_policy",
-    "onnx": "exported_onnx/forward_locomotion_policy.onnx",
+    "checkpoint": "/home/a/文档/MJX/go2_policy_export_local/forward_locomotion_policy",
+    "onnx": "/home/a/文档/MJX/exported_onnx/forward_locomotion_policy.onnx",
+    "ort_onnx": "/home/a/文档/MJX/exported_onnx/forward_locomotion_policy_ort.onnx",
     "obs_size": 52,
     "action_size": 12,
     "hidden_layer_sizes": [

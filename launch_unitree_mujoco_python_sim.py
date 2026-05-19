@@ -75,12 +75,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--home_hold_kp", type=float, default=45.0)
     parser.add_argument("--home_hold_kd", type=float, default=3.5)
     parser.add_argument("--control_mode", choices=["auto", "position_servo", "pd_torque"], default="auto")
-    parser.add_argument("--servo_kp", type=float, default=230.0)
+    parser.add_argument("--servo_kp", type=float, default=50.0)
     parser.add_argument("--servo_kd", type=float, default=0.5)
     parser.add_argument(
         "--initial_pose",
         choices=["home", "crouch", "prone"],
-        default="home",
+        default="prone",
         help="Menagerie backend initial pose before active LowCmd is received.",
     )
     parser.add_argument(
