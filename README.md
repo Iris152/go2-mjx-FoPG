@@ -163,6 +163,13 @@ python go2_unitree_sdk2_deploy.py \
 
 Do not add `--auto_start` or `--auto_policy` on the first real-robot run. With `--domain_id 0`, the runner defaults to `--release_mcf auto`: it queries Go2's MotionSwitcher service and calls `ReleaseMode()` before low-level control if a high-level motion service such as `sport_mode` is active.
 
-Policy-phase PD defaults to `policy_kp=50.0`, `policy_kd=0.5`; stand/fault phases use `60.0/5.0`.
+Sim2sim keeps `policy_kp=50.0`, `policy_kd=0.5` by default so it matches the menagerie actuator validation path. On a real robot (`--domain_id 0`), the runner now applies safer deployment defaults unless explicitly overridden:
+
+- `policy_kd=3.5`
+- `policy_ramp_duration=0.5`
+- `policy_target_filter_tau=0.04`
+- `max_policy_joint_delta=0.08`
+
+This is intentional: MuJoCo XML `servo_kd=0.5` is not numerically equivalent to Unitree hardware `LowCmd.kd=0.5`. If the legs twitch rapidly on hardware, first check the printed timing line with `--print_timing`; the expected policy rate is about 50 Hz, the LowCmd resend rate is about 500 Hz, and the gait cycle is about 0.52 s.
 
 See `GO2_DEPLOY_GUIDE.md` for the full staged checklist.

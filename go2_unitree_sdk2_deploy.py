@@ -637,6 +637,8 @@ class Go2DeployRunner:
         self.policy_latch = EnterLatch(not args.auto_policy)
         self._start_prompt_shown = False
         self._policy_prompt_shown = False
+        self._last_raw_policy_delta = 0.0
+        self._last_sent_policy_delta = 0.0
 
     def _init_lowcmd(self) -> None:
         """初始化 LowCmd 为 passive，不给电机有效位置/速度/力矩目标。"""
@@ -862,6 +864,33 @@ class Go2DeployRunner:
         alpha = min(self._phase_elapsed() / self.args.policy_ramp_duration, 1.0)
         return ((1.0 - alpha) * self.command_center_policy + alpha * policy_target).astype(np.float32)
 
+    def _condition_policy_target(self, raw_target: np.ndarray) -> np.ndarray:
+        """对策略目标做实机保护：可选低通和每个控制周期的关节目标限幅。
+
+        训练 / viewer / sim2sim 中策略目标是 50Hz 阶梯信号；仿真 actuator 会在
+        MuJoCo 内部处理这个位置伺服。但真机 LowCmd 直接进入电机 PD，若阻尼偏低
+        或相邻两帧 q_des 跳变过大，容易表现为快速抖动。这里不改变 ONNX 推理频率，
+        只在下发前对 q_des 做保守整形，并把整形后的目标写回 last_joint_target_policy，
+        让下一帧 observation 反映真实下发目标。
+        """
+        raw_target = np.asarray(raw_target, dtype=np.float32)
+        previous = self.last_joint_target_policy.astype(np.float32)
+        self._last_raw_policy_delta = float(np.max(np.abs(raw_target - previous)))
+
+        target = raw_target
+        tau = float(self.args.policy_target_filter_tau)
+        if tau > 0.0:
+            alpha = self.control_dt / (tau + self.control_dt)
+            target = ((1.0 - alpha) * previous + alpha * target).astype(np.float32)
+
+        max_delta = float(self.args.max_policy_joint_delta)
+        if max_delta > 0.0:
+            delta = np.clip(target - previous, -max_delta, max_delta)
+            target = (previous + delta).astype(np.float32)
+
+        self._last_sent_policy_delta = float(np.max(np.abs(target - previous)))
+        return target
+
     def _start_policy_control(self, note: str) -> None:
         """进入策略前重置步态相位，避免站立等待阶段影响第一拍 observation。"""
         self.control_steps = 0
@@ -943,8 +972,9 @@ class Go2DeployRunner:
             # 策略渐入阶段：逐渐从站立中心过渡到 policy target。
             target = self._compute_policy_target(state)
             blended = self._policy_ramp_target(target)
-            self.set_joint_target_command(blended, self.args.policy_kp, self.args.policy_kd)
-            self.last_joint_target_policy = blended.copy()
+            conditioned = self._condition_policy_target(blended)
+            self.set_joint_target_command(conditioned, self.args.policy_kp, self.args.policy_kd)
+            self.last_joint_target_policy = conditioned.copy()
             self.control_steps += 1
             if self._phase_elapsed() >= self.args.policy_ramp_duration:
                 self._transition(Phase.POLICY, "policy fully enabled")
@@ -953,8 +983,9 @@ class Go2DeployRunner:
         if self.phase == Phase.POLICY:
             # 正常策略阶段：每个 control_dt 更新一次 ONNX 输出。
             target = self._compute_policy_target(state)
-            self.set_joint_target_command(target, self.args.policy_kp, self.args.policy_kd)
-            self.last_joint_target_policy = target.copy()
+            conditioned = self._condition_policy_target(target)
+            self.set_joint_target_command(conditioned, self.args.policy_kp, self.args.policy_kd)
+            self.last_joint_target_policy = conditioned.copy()
             self.control_steps += 1
             return
 
@@ -975,25 +1006,61 @@ class Go2DeployRunner:
         self.wait_for_connection()
         next_policy_tick = time.perf_counter()
         next_cmd_tick = next_policy_tick
+        timing_window_start = next_policy_tick
+        policy_ticks = 0
+        cmd_ticks = 0
         while not self._shutdown_requested:
             now = time.perf_counter()
 
             if now >= next_policy_tick:
                 loop_start = time.perf_counter()
                 self.loop_once()
+                policy_ticks += 1
                 next_policy_tick += self.control_dt
                 if next_policy_tick <= now:
                     next_policy_tick = now + self.control_dt
                 if self.args.print_timing and self.phase == Phase.POLICY:
                     elapsed_ms = (time.perf_counter() - loop_start) * 1000.0
-                    print(f"[timing] {elapsed_ms:.3f} ms", flush=True)
+                    if elapsed_ms > self.control_dt * 1000.0:
+                        print(f"[timing] policy loop overrun: {elapsed_ms:.3f} ms", flush=True)
 
             now = time.perf_counter()
             if now >= next_cmd_tick:
                 self.publish_current_command()
+                cmd_ticks += 1
                 next_cmd_tick += self.args.lowcmd_dt
                 if next_cmd_tick <= now:
                     next_cmd_tick = now + self.args.lowcmd_dt
+
+            if self.args.print_timing:
+                now = time.perf_counter()
+                window = now - timing_window_start
+                if window >= 1.0:
+                    policy_hz = policy_ticks / window
+                    cmd_hz = cmd_ticks / window
+                    gait_cycle_s = self.l_cycle * self.control_dt
+                    print(
+                        "[timing] phase=%s policy_hz=%.1f lowcmd_hz=%.1f "
+                        "control_dt=%.3f lowcmd_dt=%.3f gait_cycle=%.3fs "
+                        "step=%d raw_delta=%.3f sent_delta=%.3f kp=%.1f kd=%.2f"
+                        % (
+                            self.phase.name,
+                            policy_hz,
+                            cmd_hz,
+                            self.control_dt,
+                            self.args.lowcmd_dt,
+                            gait_cycle_s,
+                            self.control_steps,
+                            self._last_raw_policy_delta,
+                            self._last_sent_policy_delta,
+                            self.args.policy_kp,
+                            self.args.policy_kd,
+                        ),
+                        flush=True,
+                    )
+                    timing_window_start = now
+                    policy_ticks = 0
+                    cmd_ticks = 0
 
             sleep_dt = min(next_policy_tick, next_cmd_tick) - time.perf_counter()
             if sleep_dt > 0:
@@ -1113,20 +1180,40 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gait_scale", type=float, default=0.3)
 
     # 阶段持续时间：先起身、站稳，再进入策略。
-    # 默认不做额外 policy ramp；进入策略前会重置步态相位。
-    # 如果真机上希望更柔和切入，可手动指定 --policy_ramp_duration 0.5 等较小值。
+    # 默认不做额外 policy ramp；真机 domain_id=0 时会在 finalize_args() 中启用更保守默认值。
     parser.add_argument("--stand_ramp_duration", type=float, default=2.5)
     parser.add_argument("--stand_hold_duration", type=float, default=0.5)
     parser.add_argument("--policy_ramp_duration", type=float, default=0.0)
 
-    # 写入 LowCmd 的 PD 增益。policy 默认对齐当前训练/仿真验证采用的 50/0.5。
-    # 真机上仍建议先低速、短时验证，再按实际稳定性逐步调整。
+    # 写入 LowCmd 的 PD 增益。仿真默认 policy_kd=0.5；真机 domain_id=0 时会恢复到 3.5。
+    # 注意：MuJoCo XML actuator 的 servo_kd=0.5 不能直接等同于 Unitree 电机 LowCmd.kd=0.5。
     parser.add_argument("--stand_kp", type=float, default=60.0)
     parser.add_argument("--stand_kd", type=float, default=5.0)
     parser.add_argument("--policy_kp", type=float, default=50.0)
     parser.add_argument("--policy_kd", type=float, default=0.5)
     parser.add_argument("--fault_kp", type=float, default=60.0)
     parser.add_argument("--fault_kd", type=float, default=5.0)
+    parser.add_argument(
+        "--real_policy_defaults",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "When domain_id=0, use safer real-robot defaults for LowCmd damping, "
+            "policy ramp, and target conditioning unless those args are explicitly set."
+        ),
+    )
+    parser.add_argument(
+        "--policy_target_filter_tau",
+        type=float,
+        default=0.0,
+        help="First-order low-pass time constant for policy q_des. 0 disables filtering.",
+    )
+    parser.add_argument(
+        "--max_policy_joint_delta",
+        type=float,
+        default=0.0,
+        help="Max absolute q_des change per policy update in rad. 0 disables rate limiting.",
+    )
 
     # 安全与退出参数。
     parser.add_argument("--tilt_limit_rad", type=float, default=0.9)
@@ -1182,10 +1269,37 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _arg_was_set(name: str) -> bool:
+    flag = "--" + name
+    prefix = flag + "="
+    return any(item == flag or item.startswith(prefix) for item in sys.argv[1:])
+
+
+def finalize_args(args: argparse.Namespace) -> argparse.Namespace:
+    """Apply safer real-robot defaults without changing sim2sim defaults.
+
+    The training XML uses servo_kd=0.5 inside MuJoCo's actuator model, but Go2
+    hardware receives Unitree LowCmd.kd.  Those gains are not numerically
+    equivalent.  Keeping kd=0.5 on hardware can be underdamped and look like
+    rapid leg twitching even when the policy frequency is correct.
+    """
+    if args.domain_id == 0 and args.real_policy_defaults:
+        if not _arg_was_set("policy_kd"):
+            args.policy_kd = 3.5
+        if not _arg_was_set("policy_ramp_duration"):
+            args.policy_ramp_duration = 0.5
+        if not _arg_was_set("policy_target_filter_tau"):
+            args.policy_target_filter_tau = 0.04
+        if not _arg_was_set("max_policy_joint_delta"):
+            args.max_policy_joint_delta = 0.08
+    return args
+
+
 def main() -> int:
-    args = parse_args()
+    args = finalize_args(parse_args())
     print(
-        "[config] network=%s domain_id=%s mode=%s command_center=%s clip_final_action=%s release_mcf=%s baseline=%s forward=%s"
+        "[config] network=%s domain_id=%s mode=%s command_center=%s clip_final_action=%s "
+        "release_mcf=%s baseline=%s forward=%s"
         % (
             args.network,
             args.domain_id,
@@ -1195,6 +1309,23 @@ def main() -> int:
             args.release_mcf,
             args.baseline_onnx,
             args.forward_onnx,
+        ),
+        flush=True,
+    )
+    print(
+        "[config] control_dt=%.3f lowcmd_dt=%.3f step_k=%d gait_cycle=%.3fs "
+        "policy_kp=%.1f policy_kd=%.2f policy_ramp=%.2f "
+        "filter_tau=%.3f max_joint_delta=%.3f"
+        % (
+            args.control_dt,
+            args.lowcmd_dt,
+            args.step_k,
+            args.control_dt * args.step_k * 2,
+            args.policy_kp,
+            args.policy_kd,
+            args.policy_ramp_duration,
+            args.policy_target_filter_tau,
+            args.max_policy_joint_delta,
         ),
         flush=True,
     )

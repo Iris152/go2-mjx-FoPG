@@ -17,7 +17,7 @@ This guide matches the current `go2_unitree_sdk2_deploy.py` runner and the lates
 
 ## 2. Default parameters
 
-Current defaults that matter for deployment:
+Current sim2sim defaults:
 
 - training / sim servo: `servo_kp=50.0`, `servo_kd=0.5`
 - policy-phase PD: `policy_kp=50.0`, `policy_kd=0.5`
@@ -27,6 +27,15 @@ Current defaults that matter for deployment:
 - idle target in Terminal B simulator: `initial`
 
 The old `230.0/0.5` sim-side servo setting is no longer the mainline default.
+
+Real-robot deployment uses safer defaults when `--domain_id 0` and `--real_policy_defaults` is enabled:
+
+- `policy_kd=3.5`
+- `policy_ramp_duration=0.5`
+- `policy_target_filter_tau=0.04`
+- `max_policy_joint_delta=0.08`
+
+This is deliberate. MuJoCo XML actuator `servo_kd=0.5` is not the same physical interface as Unitree hardware `LowCmd.kd=0.5`; using `LowCmd.kd=0.5` on the real robot can be underdamped and look like rapid leg twitching even when the policy frequency is correct.
 
 ## 3. Menagerie DDS sim2sim
 
@@ -84,12 +93,15 @@ Then run:
 conda run --no-capture-output -n mjx python go2_unitree_sdk2_deploy.py \
   --network <robot_nic> \
   --domain_id 0 \
-  --mode forward
+  --mode forward \
+  --print_timing
 ```
 
 With `--domain_id 0`, the runner checks the MotionSwitcher service and releases active high-level modes such as `sport_mode` before entering low-level control.
 
 Do not use `--auto_start` or `--auto_policy` on the first real-robot run. Keep the first validation short and low-risk.
+
+With `--print_timing`, check that the policy loop is near 50 Hz, LowCmd resend is near 500 Hz, and the printed gait cycle is about `0.52s`. If the timing is correct but the legs still twitch, treat it first as a hardware PD / target-step issue: increase damping, keep target filtering enabled, or lower `max_policy_joint_delta` before changing the policy frequency.
 
 ## 5. Verification order
 
