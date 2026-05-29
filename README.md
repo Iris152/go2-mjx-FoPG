@@ -7,7 +7,8 @@ The current main path is intentionally narrow:
 - training and validation XML: `mujoco_menagerie/unitree_go2/scene_mjx.xml`
 - training servo override: `servo_kp=50.0`, `servo_kd=0.5`
 - action scale: `ACTION_SCALE=[0.2, 0.6, 0.6] * 4`
-- forward residual reward includes lateral drift and yaw-rate penalties
+- stage-1 trot training includes an `action_rate` penalty and deploy-style reset distribution from the 2026-05-28 real-robot-tested backup
+- stage-2 forward residual reward includes lateral drift, yaw-rate, and action-rate penalties
 - ONNX export uses deterministic APG inference and writes both raw ONNX and ONNX Runtime compatible `*_ort.onnx`
 - sim2sim validation uses the same menagerie XML instead of the older `unitree_mujoco` XML path
 
@@ -62,7 +63,8 @@ By default the script uses:
 - `step_k=13`
 - `servo_kp=50.0`, `servo_kd=0.5`
 - `ACTION_SCALE=[0.2, 0.6, 0.6] * 4`
-- additional forward residual penalties: `lateral_velocity=-1.0`, `yaw_rate=-0.5`
+- stage-1 deploy-style resets: `stage1_deploy_reset_prob=0.35`, `stage1_low_reset_prob=0.15`
+- additional forward residual penalties: `lateral_velocity=-1.0`, `yaw_rate=-0.5`, `action_rate=-0.01`
 
 ## View Checkpoints
 
@@ -115,7 +117,7 @@ Default Terminal B behavior:
 - initial pose: `prone`
 - idle target: `initial`
 - control mode: `position_servo`
-- internal servo: `servo_kp=50.0`, `servo_kd=0.5`
+- position-servo mode writes active LowCmd `kp/kd` into the menagerie affine actuator
 - gyro publication: world angular velocity rotated into the base frame before publishing `imu_state.gyroscope`
 
 Terminal A, policy runner:
@@ -163,13 +165,12 @@ python go2_unitree_sdk2_deploy.py \
 
 Do not add `--auto_start` or `--auto_policy` on the first real-robot run. With `--domain_id 0`, the runner defaults to `--release_mcf auto`: it queries Go2's MotionSwitcher service and calls `ReleaseMode()` before low-level control if a high-level motion service such as `sport_mode` is active.
 
-Sim2sim keeps `policy_kp=50.0`, `policy_kd=0.5` by default so it matches the menagerie actuator validation path. On a real robot (`--domain_id 0`), the runner now applies safer deployment defaults unless explicitly overridden:
+Sim2sim keeps `policy_kp=50.0`, `policy_kd=0.5` by default. This branch intentionally matches the 2026-05-28 real-robot-tested backup. On a real robot (`--domain_id 0`), the runner keeps `policy_kd=0.5` unless explicitly overridden and applies these startup-conditioning defaults:
 
-- `policy_kd=3.5`
 - `policy_ramp_duration=0.5`
 - `policy_target_filter_tau=0.04`
 - `max_policy_joint_delta=0.08`
 
-This is intentional: MuJoCo XML `servo_kd=0.5` is not numerically equivalent to Unitree hardware `LowCmd.kd=0.5`. If the legs twitch rapidly on hardware, first check the printed timing line with `--print_timing`; the expected policy rate is about 50 Hz, the LowCmd resend rate is about 500 Hz, and the gait cycle is about 0.52 s.
+If the legs twitch rapidly on hardware, first check the printed timing line with `--print_timing`; the expected policy rate is about 50 Hz, the LowCmd resend rate is about 500 Hz, and the gait cycle is about 0.52 s.
 
 See `GO2_DEPLOY_GUIDE.md` for the full staged checklist.

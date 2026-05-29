@@ -1180,12 +1180,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gait_scale", type=float, default=0.3)
 
     # 阶段持续时间：先起身、站稳，再进入策略。
-    # 默认不做额外 policy ramp；真机 domain_id=0 时会在 finalize_args() 中启用更保守默认值。
+    # 0528 实机测试版默认保留较短 policy ramp；真机 domain_id=0 时只补充滤波/限幅默认值。
     parser.add_argument("--stand_ramp_duration", type=float, default=2.5)
     parser.add_argument("--stand_hold_duration", type=float, default=0.5)
-    parser.add_argument("--policy_ramp_duration", type=float, default=0.0)
+    parser.add_argument("--policy_ramp_duration", type=float, default=0.1)
 
-    # 写入 LowCmd 的 PD 增益。仿真默认 policy_kd=0.5；真机 domain_id=0 时会恢复到 3.5。
+    # 写入 LowCmd 的 PD 增益。0528 实机测试版仿真和真机默认都使用 policy_kd=0.5。
     # 注意：MuJoCo XML actuator 的 servo_kd=0.5 不能直接等同于 Unitree 电机 LowCmd.kd=0.5。
     parser.add_argument("--stand_kp", type=float, default=60.0)
     parser.add_argument("--stand_kd", type=float, default=5.0)
@@ -1198,8 +1198,8 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help=(
-            "When domain_id=0, use safer real-robot defaults for LowCmd damping, "
-            "policy ramp, and target conditioning unless those args are explicitly set."
+            "When domain_id=0, use the 0528 real-robot defaults for policy ramp "
+            "and target conditioning unless those args are explicitly set."
         ),
     )
     parser.add_argument(
@@ -1276,16 +1276,10 @@ def _arg_was_set(name: str) -> bool:
 
 
 def finalize_args(args: argparse.Namespace) -> argparse.Namespace:
-    """Apply safer real-robot defaults without changing sim2sim defaults.
-
-    The training XML uses servo_kd=0.5 inside MuJoCo's actuator model, but Go2
-    hardware receives Unitree LowCmd.kd.  Those gains are not numerically
-    equivalent.  Keeping kd=0.5 on hardware can be underdamped and look like
-    rapid leg twitching even when the policy frequency is correct.
-    """
+    """Apply the 0528 real-robot startup defaults without changing sim2sim defaults."""
     if args.domain_id == 0 and args.real_policy_defaults:
         if not _arg_was_set("policy_kd"):
-            args.policy_kd = 3.5
+            args.policy_kd = 0.5
         if not _arg_was_set("policy_ramp_duration"):
             args.policy_ramp_duration = 0.5
         if not _arg_was_set("policy_target_filter_tau"):

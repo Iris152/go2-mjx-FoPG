@@ -131,6 +131,67 @@ def apply_training_servo_pd(mj_model: mujoco.MjModel, kp: float, kd: float) -> N
     mj_model.actuator_biasprm[:, 2] = -float(kd)
 
 
+def initial_joint_pose_np(pose: str, home_q: np.ndarray) -> np.ndarray:
+    if pose == "home":
+        return home_q.copy()
+    if pose == "crouch":
+        return np.asarray([0.0, 1.25, -2.45] * 4, dtype=np.float64)
+    if pose == "prone":
+        return np.asarray([0.0, 1.45, -2.60] * 4, dtype=np.float64)
+    raise ValueError(f"unsupported initial pose: {pose}")
+
+
+def simulate_deploy_policy_start(
+    *,
+    xml_path: str,
+    initial_pose: str,
+    stand_ramp_duration: float,
+    stand_hold_duration: float,
+    stand_kp: float,
+    stand_kd: float,
+    n_frames: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """用 MuJoCo 预计算 deploy 进入 policy 前的站立后状态。
+
+    训练环境本身仍使用 policy 阶段的 actuator PD；这里只把 deploy 的
+    stand_ramp + stand_hold 结果作为 reset 分布中的一个初始状态。
+    """
+    model = mujoco.MjModel.from_xml_path(str(xml_path))
+    apply_training_servo_pd(model, stand_kp, stand_kd)
+    data = mujoco.MjData(model)
+
+    home_qpos = model.keyframe(KEYFRAME_NAME).qpos.copy()
+    home_joint_q = home_qpos[7:19].copy()
+    start_joint_q = initial_joint_pose_np(initial_pose, home_joint_q)
+
+    data.qpos[:] = home_qpos
+    data.qvel[:] = 0.0
+    data.qpos[7:19] = start_joint_q
+    if initial_pose == "crouch":
+        data.qpos[2] = 0.20
+    elif initial_pose == "prone":
+        data.qpos[2] = 0.13
+    data.ctrl[:] = start_joint_q
+    mujoco.mj_forward(model, data)
+
+    control_dt = float(model.opt.timestep) * int(n_frames)
+    total_duration = max(0.0, float(stand_ramp_duration)) + max(0.0, float(stand_hold_duration))
+    control_steps = int(np.ceil(total_duration / control_dt))
+    phase_start_q = data.qpos[7:19].copy()
+    for i in range(control_steps):
+        elapsed = (i + 1) * control_dt
+        if stand_ramp_duration > 0.0 and elapsed <= stand_ramp_duration:
+            alpha = min(elapsed / stand_ramp_duration, 1.0)
+            ctrl = (1.0 - alpha) * phase_start_q + alpha * home_joint_q
+        else:
+            ctrl = home_joint_q
+        data.ctrl[:] = ctrl
+        for _ in range(int(n_frames)):
+            mujoco.mj_step(model, data)
+
+    return data.qpos.copy(), data.qvel.copy()
+
+
 def cos_wave(t: jax.Array, step_period: float, scale: float) -> jax.Array:
     wave = -jp.cos(((2.0 * jp.pi) / step_period) * t)
     return wave * (scale / 2.0) + (scale / 2.0)
@@ -232,6 +293,7 @@ def get_stage1_config() -> config_dict.ConfigDict:
                             min_reference_tracking=-2.5 * 3e-3,
                             reference_tracking=-1.0,
                             feet_height=-1.0,
+                            action_rate=-0.01,
                         )
                     )
                 )
@@ -253,10 +315,12 @@ def get_stage2_config() -> config_dict.ConfigDict:
                             lin_vel_z=-1.0,
                             lateral_velocity=-1.0,
                             yaw_rate=-0.5,
+                            heading=-1.0,
                             torque=-0.01,
                             feet_pos=-1.0,
                             feet_height=-1.0,
                             joint_velocity=-0.001,
+                            action_rate=-0.01,
                         )
                     )
                 )
@@ -274,6 +338,19 @@ class Go2MjxBaseEnv(PipelineEnv):
         servo_kp: float,
         servo_kd: float,
         termination_height: float,
+        reset_deploy_prob: float = 0.0,
+        reset_low_prob: float = 0.0,
+        reset_last_action_to_home: bool = True,
+        reset_joint_noise: float = 0.03,
+        reset_joint_vel_noise: float = 0.05,
+        reset_xy_noise: float = 0.03,
+        reset_low_base_z_drop: float = 0.035,
+        reset_hind_calf_extra: float = 0.18,
+        deploy_initial_pose: str = "prone",
+        deploy_stand_ramp_duration: float = 2.5,
+        deploy_stand_hold_duration: float = 0.5,
+        deploy_stand_kp: float = 60.0,
+        deploy_stand_kd: float = 5.0,
         n_frames: int = 10,
         **kwargs,
     ):
@@ -283,6 +360,14 @@ class Go2MjxBaseEnv(PipelineEnv):
         self.servo_kp = float(servo_kp)
         self.servo_kd = float(servo_kd)
         self.termination_height = float(termination_height)
+        self.reset_deploy_prob = float(reset_deploy_prob)
+        self.reset_low_prob = float(reset_low_prob)
+        self.reset_last_action_to_home = bool(reset_last_action_to_home)
+        self.reset_joint_noise = float(reset_joint_noise)
+        self.reset_joint_vel_noise = float(reset_joint_vel_noise)
+        self.reset_xy_noise = float(reset_xy_noise)
+        self.reset_low_base_z_drop = float(reset_low_base_z_drop)
+        self.reset_hind_calf_extra = float(reset_hind_calf_extra)
 
         mj_model = mujoco.MjModel.from_xml_path(self.xml_path)
         apply_training_servo_pd(mj_model, self.servo_kp, self.servo_kd)
@@ -298,6 +383,19 @@ class Go2MjxBaseEnv(PipelineEnv):
         self.action_loc = self._default_ap_pose
         self.action_scale = jp.array(ACTION_SCALE, dtype=jp.float64)
         self.feet_inds = get_geom_ids(mj_model, FEET_GEOM_NAMES)
+        self._hind_calf_qpos_inds = jp.array([15, 18], dtype=jp.int32)
+
+        deploy_qpos, deploy_qvel = simulate_deploy_policy_start(
+            xml_path=self.xml_path,
+            initial_pose=deploy_initial_pose,
+            stand_ramp_duration=deploy_stand_ramp_duration,
+            stand_hold_duration=deploy_stand_hold_duration,
+            stand_kp=deploy_stand_kp,
+            stand_kd=deploy_stand_kd,
+            n_frames=int(kwargs["n_frames"]),
+        )
+        self._deploy_start_qpos = jp.array(deploy_qpos, dtype=jp.float64)
+        self._deploy_start_qvel = jp.array(deploy_qvel, dtype=jp.float64)
 
         kinematic_ref_qpos = make_kinematic_ref(cos_wave, self.step_k, scale=0.3, dt=self.dt)
         self.l_cycle = jp.array(int(kinematic_ref_qpos.shape[0]), dtype=jp.int32)
@@ -352,6 +450,46 @@ class Go2MjxBaseEnv(PipelineEnv):
         ]
         return jp.clip(jp.concatenate(obs_list), -100.0, 100.0)
 
+    def _reward_action_rate(self, current_action: jax.Array, previous_action: jax.Array) -> jax.Array:
+        return jp.sum(jp.square(current_action - previous_action))
+
+    def _sample_reset_distribution(
+        self,
+        rng: jax.Array,
+        qpos: jax.Array,
+        qvel: jax.Array,
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        key_branch, key_joint, key_vel, key_xy, key_calf, key_z = jax.random.split(rng, 6)
+        branch = jax.random.uniform(key_branch, ())
+        deploy_prob = jp.clip(jp.array(self.reset_deploy_prob), 0.0, 1.0)
+        low_prob = jp.clip(jp.array(self.reset_low_prob), 0.0, 1.0 - deploy_prob)
+        use_deploy = branch < deploy_prob
+        use_low = jp.logical_and(branch >= deploy_prob, branch < deploy_prob + low_prob)
+        deploy_like = jp.logical_or(use_deploy, use_low)
+
+        calf_extra = self.reset_hind_calf_extra * jax.random.uniform(key_calf, (2,))
+        z_drop = self.reset_low_base_z_drop * jax.random.uniform(key_z, ())
+        qpos_low = qpos.at[self._hind_calf_qpos_inds].add(-calf_extra)
+        qpos_low = qpos_low.at[2].add(-z_drop)
+
+        qpos = jp.where(use_deploy, self._deploy_start_qpos, jp.where(use_low, qpos_low, qpos))
+        qvel = jp.where(use_deploy, self._deploy_start_qvel, qvel)
+
+        joint_noise = self.reset_joint_noise * (2.0 * jax.random.uniform(key_joint, (ACTION_SIZE,)) - 1.0)
+        joint_vel_noise = self.reset_joint_vel_noise * (
+            2.0 * jax.random.uniform(key_vel, (ACTION_SIZE,)) - 1.0
+        )
+        xy_noise = self.reset_xy_noise * (2.0 * jax.random.uniform(key_xy, (2,)) - 1.0)
+        qpos = qpos.at[7:19].add(jp.where(deploy_like, joint_noise, jp.zeros_like(joint_noise)))
+        qvel = qvel.at[6:18].add(jp.where(deploy_like, joint_vel_noise, jp.zeros_like(joint_vel_noise)))
+        qpos = qpos.at[0:2].add(jp.where(deploy_like, xy_noise, jp.zeros_like(xy_noise)))
+        return qpos, qvel, deploy_like
+
+    def _initial_last_action(self, deploy_like: jax.Array) -> jax.Array:
+        if self.reset_last_action_to_home:
+            return self.action_loc
+        return jp.where(deploy_like, self.action_loc, jp.zeros(ACTION_SIZE))
+
 
 class TrotGo2Local(Go2MjxBaseEnv):
     def __init__(
@@ -362,6 +500,7 @@ class TrotGo2Local(Go2MjxBaseEnv):
         servo_kp: float = 50.0,
         servo_kd: float = 0.5,
         termination_height: float = 0.25,
+        action_rate_scale: float = -0.01,
         **kwargs,
     ):
         super().__init__(
@@ -374,6 +513,7 @@ class TrotGo2Local(Go2MjxBaseEnv):
         )
         self.err_threshold = 0.4
         self.reward_config = get_stage1_config()
+        self.reward_config.rewards.scales.action_rate = float(action_rate_scale)
 
         ref_q_delta = make_kinematic_ref(cos_wave, self.step_k, scale=0.3, dt=self.dt)
         ref_qd_delta = make_kinematic_ref(dcos_wave, self.step_k, scale=0.3, dt=self.dt)
@@ -387,7 +527,13 @@ class TrotGo2Local(Go2MjxBaseEnv):
         self.kinematic_ref_qvel = jp.array(ref_qvel_full)
 
     def reset(self, rng: jax.Array) -> State:
-        qpos, data = self._settle_on_ground(self._init_q, self._default_qvel)
+        rng, reset_key = jax.random.split(rng)
+        qpos, qvel, deploy_like = self._sample_reset_distribution(
+            reset_key,
+            self._init_q,
+            self._default_qvel,
+        )
+        qpos, data = self._settle_on_ground(qpos, qvel)
         state_info = {
             "rng": rng,
             "steps": jp.array(0.0),
@@ -395,8 +541,10 @@ class TrotGo2Local(Go2MjxBaseEnv):
                 "reference_tracking": jp.array(0.0),
                 "min_reference_tracking": jp.array(0.0),
                 "feet_height": jp.array(0.0),
+                "action_rate": jp.array(0.0),
             },
-            "last_action": jp.zeros(ACTION_SIZE),
+            "last_action": self._initial_last_action(deploy_like),
+            "last_policy_action": jp.zeros(ACTION_SIZE),
             "kinematic_ref": jp.zeros(self._mj_model.nq),
         }
         obs = self._get_inner_obs(qpos, data.x, data.xd, state_info)
@@ -437,6 +585,10 @@ class TrotGo2Local(Go2MjxBaseEnv):
                 )
                 * self.reward_config.rewards.scales.feet_height
             ),
+            "action_rate": (
+                self._reward_action_rate(raw_action, state.info["last_policy_action"])
+                * self.reward_config.rewards.scales.action_rate
+            ),
         }
         reward = sum(reward_tuple.values())
 
@@ -452,6 +604,7 @@ class TrotGo2Local(Go2MjxBaseEnv):
         info = dict(state.info)
         info["reward_tuple"] = reward_tuple
         info["last_action"] = desired_q
+        info["last_policy_action"] = raw_action
         info["kinematic_ref"] = ref_qpos
 
         obs = self._get_inner_obs(data.qpos, data.x, data.xd, info)
@@ -500,6 +653,8 @@ class FwdTrotGo2Local(Go2MjxBaseEnv):
         servo_kd: float = 0.5,
         termination_height: float = 0.25,
         clip_final_action: bool = False,
+        action_rate_scale: float = -0.01,
+        heading_scale: float = -1.0,
         **kwargs,
     ):
         super().__init__(
@@ -516,10 +671,12 @@ class FwdTrotGo2Local(Go2MjxBaseEnv):
         self.gait_period = float(self.step_k * 2) * self.dt
         self.hip_inds = get_body_ids(self._mj_model, HIP_BODY_NAMES)
         self.reward_config = get_stage2_config()
+        self.reward_config.rewards.scales.action_rate = float(action_rate_scale)
+        self.reward_config.rewards.scales.heading = float(heading_scale)
         self.clip_final_action = bool(clip_final_action)
 
     def reset(self, rng: jax.Array) -> State:
-        rng, key_xyz, key_ang, key_ax, key_q, key_qd = jax.random.split(rng, 6)
+        rng, key_xyz, key_ang, key_ax, key_q, key_qd, reset_key = jax.random.split(rng, 7)
         qpos = self._init_q
         qvel = self._default_qvel
 
@@ -536,6 +693,7 @@ class FwdTrotGo2Local(Go2MjxBaseEnv):
         qpos = qpos.at[7:19].set(qpos[7:19] + r_joint_q)
         qvel = qvel.at[6:18].set(qvel[6:18] + r_joint_qd)
 
+        qpos, qvel, deploy_like = self._sample_reset_distribution(reset_key, qpos, qvel)
         qpos, data = self._settle_on_ground(qpos, qvel)
         state_info = {
             "rng": rng,
@@ -547,13 +705,16 @@ class FwdTrotGo2Local(Go2MjxBaseEnv):
                 "lin_vel_z": jp.array(0.0),
                 "lateral_velocity": jp.array(0.0),
                 "yaw_rate": jp.array(0.0),
+                "heading": jp.array(0.0),
                 "torque": jp.array(0.0),
                 "joint_velocity": jp.array(0.0),
                 "feet_pos": jp.array(0.0),
                 "feet_height": jp.array(0.0),
+                "action_rate": jp.array(0.0),
             },
-            "last_action": jp.zeros(ACTION_SIZE),
+            "last_action": self._initial_last_action(deploy_like),
             "baseline_action": jp.zeros(ACTION_SIZE),
+            "last_full_action": jp.zeros(ACTION_SIZE),
             "xy0": jp.zeros((4, 2)),
             "k0": jp.array(0.0),
             "xy_star": jp.zeros((4, 2)),
@@ -563,6 +724,11 @@ class FwdTrotGo2Local(Go2MjxBaseEnv):
         action_key, next_rng = jax.random.split(state_info["rng"])
         state_info["rng"] = next_rng
         baseline_action, _ = self.baseline_inference_fn(inner_obs, action_key)
+        state_info["baseline_action"] = baseline_action
+        if self.reset_last_action_to_home:
+            state_info["last_full_action"] = jp.zeros(ACTION_SIZE)
+        else:
+            state_info["last_full_action"] = baseline_action
         obs = jp.concatenate([inner_obs, baseline_action])
 
         reward = jp.array(0.0)
@@ -618,6 +784,7 @@ class FwdTrotGo2Local(Go2MjxBaseEnv):
                 self._reward_lateral_velocity(x, xd) * self.reward_config.rewards.scales.lateral_velocity
             ),
             "yaw_rate": self._reward_yaw_rate(x, xd) * self.reward_config.rewards.scales.yaw_rate,
+            "heading": self._reward_heading(x) * self.reward_config.rewards.scales.heading,
             "height": self._reward_height(data.qpos) * self.reward_config.rewards.scales.height,
             "torque": self._reward_action(data.qfrc_actuator) * self.reward_config.rewards.scales.torque,
             "joint_velocity": (
@@ -627,6 +794,10 @@ class FwdTrotGo2Local(Go2MjxBaseEnv):
             "feet_height": (
                 self._reward_feet_height(data, info_for_rewards) * self.reward_config.rewards.scales.feet_height
             ),
+            "action_rate": (
+                self._reward_action_rate(full_action, state.info["last_full_action"])
+                * self.reward_config.rewards.scales.action_rate
+            ),
         }
         reward = sum(reward_tuple.values())
 
@@ -634,6 +805,7 @@ class FwdTrotGo2Local(Go2MjxBaseEnv):
         info["reward_tuple"] = reward_tuple
         info["last_action"] = desired_q
         info["baseline_action"] = baseline_action
+        info["last_full_action"] = full_action
         info["xy_star"] = xy_targets
         info["k0"] = info_for_rewards["k0"]
         info["xy0"] = info_for_rewards["xy0"]
@@ -668,6 +840,10 @@ class FwdTrotGo2Local(Go2MjxBaseEnv):
     def _reward_yaw_rate(self, x: Transform, xd: Motion) -> jax.Array:
         local_ang = math.rotate(xd.ang[0], math.quat_inv(x.rot[0]))
         return jp.clip(jp.square(local_ang[2]), 0.0, 10.0)
+
+    def _reward_heading(self, x: Transform) -> jax.Array:
+        forward = math.rotate(jp.array([1.0, 0.0, 0.0]), x.rot[0])
+        return jp.clip(jp.square(forward[1]), 0.0, 10.0)
 
     def _reward_orientation(self, x: Transform) -> jax.Array:
         up = jp.array([0.0, 0.0, 1.0])
@@ -911,6 +1087,32 @@ def make_stage2_train_fn(args: argparse.Namespace):
     )
 
 
+def reset_kwargs(args: argparse.Namespace, stage: str) -> dict[str, Any]:
+    if stage == "stage1":
+        deploy_prob = args.stage1_deploy_reset_prob
+        low_prob = args.stage1_low_reset_prob
+    elif stage == "stage2":
+        deploy_prob = args.stage2_deploy_reset_prob
+        low_prob = args.stage2_low_reset_prob
+    else:
+        raise ValueError(f"unknown reset kwargs stage: {stage}")
+    return dict(
+        reset_deploy_prob=deploy_prob,
+        reset_low_prob=low_prob,
+        reset_last_action_to_home=args.reset_last_action_to_home,
+        reset_joint_noise=args.reset_joint_noise,
+        reset_joint_vel_noise=args.reset_joint_vel_noise,
+        reset_xy_noise=args.reset_xy_noise,
+        reset_low_base_z_drop=args.reset_low_base_z_drop,
+        reset_hind_calf_extra=args.reset_hind_calf_extra,
+        deploy_initial_pose=args.deploy_initial_pose,
+        deploy_stand_ramp_duration=args.deploy_stand_ramp_duration,
+        deploy_stand_hold_duration=args.deploy_stand_hold_duration,
+        deploy_stand_kp=args.deploy_stand_kp,
+        deploy_stand_kd=args.deploy_stand_kd,
+    )
+
+
 def run_stage1(args: argparse.Namespace, run_dir: Path, xml_path: Path) -> tuple[Path, Any, Any]:
     print("[stage1] building envs", flush=True)
     env = envs.get_environment(
@@ -919,6 +1121,8 @@ def run_stage1(args: argparse.Namespace, run_dir: Path, xml_path: Path) -> tuple
         step_k=args.step_k,
         servo_kp=args.servo_kp,
         servo_kd=args.servo_kd,
+        action_rate_scale=args.stage1_action_rate_scale,
+        **reset_kwargs(args, "stage1"),
     )
     eval_env = envs.get_environment(
         "go2_mjx_local_trot",
@@ -926,6 +1130,8 @@ def run_stage1(args: argparse.Namespace, run_dir: Path, xml_path: Path) -> tuple
         step_k=args.step_k,
         servo_kp=args.servo_kp,
         servo_kd=args.servo_kd,
+        action_rate_scale=args.stage1_action_rate_scale,
+        **reset_kwargs(args, "stage1"),
     )
 
     progress = make_progress_logger(args.stage1_updates, args.num_evals, "stage1")
@@ -994,6 +1200,9 @@ def run_stage2(
         servo_kp=args.servo_kp,
         servo_kd=args.servo_kd,
         clip_final_action=args.clip_final_action,
+        action_rate_scale=args.stage2_action_rate_scale,
+        heading_scale=args.stage2_heading_scale,
+        **reset_kwargs(args, "stage2"),
     )
 
     print("[stage2] building envs", flush=True)
@@ -1052,6 +1261,8 @@ def validate_setup(args: argparse.Namespace, xml_path: Path, baseline_checkpoint
         step_k=args.step_k,
         servo_kp=args.servo_kp,
         servo_kd=args.servo_kd,
+        action_rate_scale=args.stage1_action_rate_scale,
+        **reset_kwargs(args, "stage1"),
     )
     state = stage1.reset(jax.random.PRNGKey(args.seed))
     print("[validate] stage1 obs shape:", tuple(state.obs.shape), flush=True)
@@ -1077,6 +1288,9 @@ def validate_setup(args: argparse.Namespace, xml_path: Path, baseline_checkpoint
         servo_kp=args.servo_kp,
         servo_kd=args.servo_kd,
         clip_final_action=args.clip_final_action,
+        action_rate_scale=args.stage2_action_rate_scale,
+        heading_scale=args.stage2_heading_scale,
+        **reset_kwargs(args, "stage2"),
     )
     state = stage2.reset(jax.random.PRNGKey(args.seed))
     print("[validate] stage2 obs shape:", tuple(state.obs.shape), flush=True)
@@ -1098,7 +1312,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target_vel", type=float, default=0.75)
 
     parser.add_argument("--stage1_updates", type=int, default=499)
-    parser.add_argument("--stage2_updates", type=int, default=499)
+    parser.add_argument("--stage2_updates", type=int, default=147)
     parser.add_argument("--stage1_episode_length", type=int, default=240)
     parser.add_argument("--stage2_episode_length", type=int, default=1000)
     parser.add_argument("--horizon_length", type=int, default=32)
@@ -1108,6 +1322,39 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stage1_lr", type=float, default=1e-4)
     parser.add_argument("--stage2_lr", type=float, default=1.5e-4)
     parser.add_argument("--stage2_schedule_decay", type=float, default=0.995)
+    parser.add_argument("--stage1_action_rate_scale", type=float, default=-0.01)
+    parser.add_argument("--stage2_action_rate_scale", type=float, default=-0.01)
+    parser.add_argument(
+        "--stage2_heading_scale",
+        type=float,
+        default=0.0,
+        help="Penalty for squared world-y component of the base forward axis.",
+    )
+    parser.add_argument("--stage1_deploy_reset_prob", type=float, default=0.35)
+    parser.add_argument("--stage1_low_reset_prob", type=float, default=0.15)
+    parser.add_argument("--stage2_deploy_reset_prob", type=float, default=0.10)
+    parser.add_argument("--stage2_low_reset_prob", type=float, default=0.0)
+    parser.add_argument(
+        "--deploy_initial_pose",
+        choices=("home", "crouch", "prone"),
+        default="prone",
+        help="Deploy-style reset uses this initial pose before stand_ramp.",
+    )
+    parser.add_argument("--deploy_stand_ramp_duration", type=float, default=2.5)
+    parser.add_argument("--deploy_stand_hold_duration", type=float, default=0.5)
+    parser.add_argument("--deploy_stand_kp", type=float, default=60.0)
+    parser.add_argument("--deploy_stand_kd", type=float, default=5.0)
+    parser.add_argument(
+        "--reset_last_action_to_home",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Reset obs last_action to the home policy target instead of zeros.",
+    )
+    parser.add_argument("--reset_joint_noise", type=float, default=0.03)
+    parser.add_argument("--reset_joint_vel_noise", type=float, default=0.05)
+    parser.add_argument("--reset_xy_noise", type=float, default=0.03)
+    parser.add_argument("--reset_low_base_z_drop", type=float, default=0.035)
+    parser.add_argument("--reset_hind_calf_extra", type=float, default=0.18)
 
     parser.add_argument("--use_float64", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--debug_nans", action=argparse.BooleanOptionalAction, default=True)
@@ -1178,6 +1425,13 @@ def main() -> int:
     print(f"run_dir     : {run_dir}", flush=True)
     print(f"policy_root : {Path(args.policy_root).expanduser().resolve()}", flush=True)
     print(f"JAX devices : {[str(d) for d in jax.devices()]}", flush=True)
+    print(
+        "reset_dist  : "
+        f"stage1 deploy={args.stage1_deploy_reset_prob:.2f} low={args.stage1_low_reset_prob:.2f}; "
+        f"stage2 deploy={args.stage2_deploy_reset_prob:.2f} low={args.stage2_low_reset_prob:.2f}; "
+        f"last_action_home={args.reset_last_action_to_home}",
+        flush=True,
+    )
     print("=" * 88, flush=True)
 
     baseline_checkpoint = resolve_baseline_checkpoint(args, run_dir)

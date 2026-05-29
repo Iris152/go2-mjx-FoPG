@@ -5,7 +5,8 @@ This repository keeps the current useful GO2 MJX/FoPG path:
 - local MJX/FoPG training on `mujoco_menagerie/unitree_go2/scene_mjx.xml`
 - explicit training servo override: `servo_kp=50.0`, `servo_kd=0.5`
 - action scale: `[0.2, 0.6, 0.6] * 4`
-- second-stage forward residual training with `lateral_velocity` and `yaw_rate` penalties
+- first-stage trot training with action-rate penalty and deploy-style reset distribution from the 2026-05-28 real-robot-tested backup
+- second-stage forward residual training with `lateral_velocity`, `yaw_rate`, and action-rate penalties
 - deterministic checkpoint viewer
 - checkpoint to ONNX and ONNX Runtime export through one exporter script
 - menagerie XML DDS sim2sim validation

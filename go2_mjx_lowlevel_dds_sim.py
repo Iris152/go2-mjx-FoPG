@@ -7,9 +7,8 @@
 3. 发布 `rt/lowstate`，让 deploy runner 以为自己正在和 Unitree 低层通信。
 
 默认 `control_mode=auto` 会在 menagerie 的 *_mjx.xml 上走 position_servo：
-LowCmd.q -> MuJoCo ctrl，仿真器内部用 servo_kp/servo_kd 作为 XML actuator 增益。
-这种模式用于保持“训练 XML 同源验证”。如果使用 torque-motor XML，则可切到 pd_torque，
-此时才会按 LowCmd 的 kp/kd/tau 显式计算力矩。
+LowCmd.q -> MuJoCo ctrl，并把 LowCmd.kp/kd 写入 XML actuator 增益。
+如果使用 torque-motor XML，则可切到 pd_torque，此时按 LowCmd 的 kp/kd/tau 显式计算力矩。
 """
 
 from __future__ import annotations
@@ -181,19 +180,18 @@ def parse_args() -> argparse.Namespace:
         ),
     )
 
-    # menagerie scene_mjx.xml 的原始 actuator 是位置伺服语义；新训练默认使用 50/0.5。
-    # 这里默认同样覆盖到 50/0.5，让双终端仿真贴近当前训练时的 actuator 设置。
+    # 兼容旧命令行参数；position_servo 模式现在使用 LowCmd.kp/kd 动态写入 actuator。
     parser.add_argument(
         "--servo_kp",
         type=float,
         default=50.0,
-        help="Position-servo gain applied to menagerie go2_mjx/scene_mjx XMLs.",
+        help="Deprecated fallback only; active LowCmd.kp is used in position_servo mode.",
     )
     parser.add_argument(
         "--servo_kd",
         type=float,
         default=0.5,
-        help="Position-servo damping term applied to menagerie go2_mjx/scene_mjx XMLs.",
+        help="Deprecated fallback only; active LowCmd.kd is used in position_servo mode.",
     )
     parser.add_argument("--headless", action="store_true")
     parser.add_argument(
@@ -250,12 +248,6 @@ class Go2MujocoDdsSim:
         self.actuator_id = np.asarray(self.actuator_id, dtype=np.int64)
 
         self.control_mode = self._resolve_control_mode(args.control_mode)
-        if self.control_mode == "position_servo":
-            # position_servo 模式下，MuJoCo ctrl 表示“目标关节位置”。
-            # 修改 gain/bias 后，近似为 torque = servo_kp * (ctrl - q) - servo_kd * dq。
-            self.model.actuator_gainprm[self.actuator_id, 0] = float(args.servo_kp)
-            self.model.actuator_biasprm[self.actuator_id, 1] = -float(args.servo_kp)
-            self.model.actuator_biasprm[self.actuator_id, 2] = -float(args.servo_kd)
 
         self.data = mujoco.MjData(self.model)
         self.ctrl_min = self.model.actuator_ctrlrange[self.actuator_id, 0].astype(np.float32)
@@ -396,11 +388,19 @@ class Go2MujocoDdsSim:
         dq = self.data.qvel[self.qvel_adr].astype(np.float32)
         return q, dq
 
+    def _set_position_servo_pd(self, kp: np.ndarray | float, kd: np.ndarray | float) -> None:
+        """把 Unitree LowCmd 的位置 PD 增益写入 menagerie affine actuator。"""
+        kp_arr = np.broadcast_to(np.asarray(kp, dtype=np.float32), (12,))
+        kd_arr = np.broadcast_to(np.asarray(kd, dtype=np.float32), (12,))
+        self.model.actuator_gainprm[self.actuator_id, 0] = kp_arr
+        self.model.actuator_biasprm[self.actuator_id, 1] = -kp_arr
+        self.model.actuator_biasprm[self.actuator_id, 2] = -kd_arr
+
     def _compute_control(self, q: np.ndarray, dq: np.ndarray) -> np.ndarray:
         """根据最新 LowCmd 计算 MuJoCo actuator ctrl。
 
         position_servo:
-            ctrl 直接等于 LowCmd.q，LowCmd.kp/kd/tau 在默认 menagerie 仿真中不参与力矩计算。
+            ctrl 直接等于 LowCmd.q，同时把 LowCmd.kp/kd 写入 affine actuator。
         pd_torque:
             ctrl 被当作 torque，显式使用 LowCmd 的 tau/kp/kd/q/dq 计算。
         """
@@ -409,9 +409,11 @@ class Go2MujocoDdsSim:
 
         if self.control_mode == "position_servo":
             if cmd.active and cmd_is_fresh:
-                # menagerie position actuator：ctrl 是目标关节角。
+                # menagerie position actuator：ctrl 是目标关节角，PD 增益来自 LowCmd。
+                self._set_position_servo_pd(cmd.kp, cmd.kd)
                 ctrl = cmd.q
             else:
+                self._set_position_servo_pd(self.args.idle_kp, self.args.idle_kd)
                 ctrl = self.idle_q
         else:
             if cmd.active and cmd_is_fresh:
@@ -506,11 +508,12 @@ class Go2MujocoDdsSim:
         )
         print("[sim-config] unitree order -> policy order map:", UNITREE_TO_POLICY.tolist(), flush=True)
         print(
-            "[sim-config] control_mode=%s servo_kp=%.1f servo_kd=%.2f initial_pose=%s idle_target=%s"
+            "[sim-config] control_mode=%s lowcmd_pd=%s idle_kp=%.1f idle_kd=%.1f initial_pose=%s idle_target=%s"
             % (
                 self.control_mode,
-                self.args.servo_kp,
-                self.args.servo_kd,
+                "dynamic" if self.control_mode == "position_servo" else "pd_torque",
+                self.args.idle_kp,
+                self.args.idle_kd,
                 self.args.initial_pose,
                 self.args.idle_target,
             ),
