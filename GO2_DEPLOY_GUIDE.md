@@ -122,11 +122,11 @@ python go2_unitree_sdk2_deploy.py \
 
 第一次真机不要加 `--auto_start --auto_policy`，先手动触发更稳。
 
-0528 实机测试版的真机默认会保留 `policy_kd=0.5`，并在 `domain_id=0` 时默认补充：
+真机默认会保留 `policy_kd=0.5`，并在 `domain_id=0` 时默认补充：
 
-- `policy_ramp_duration=0.5`
-- `policy_target_filter_tau=0.04`
-- `max_policy_joint_delta=0.08`
+- `policy_ramp_duration=0.1`
+- `policy_target_filter_tau=0.0`
+- `max_policy_joint_delta=0.125`
 
 ## 5. 建议的验证顺序
 
